@@ -6,11 +6,34 @@ from asyncio import TimeoutError
 from json import dumps
 from typing import Any
 
-from aiohttp import ClientSession, ClientResponseError
+from aiohttp import ClientError, ClientResponse, ClientSession, ClientResponseError
 
 from .const import GE_CORP_ID, REST_API_BASE_URL
 from .user import User
-from .exceptions import BadRequestError, TwoFactorRequiredError, AuthFailedError, CyncError
+from .exceptions import (BadRequestError, TwoFactorRequiredError, AuthFailedError, CyncError, InvalidPasswordError,
+                         InvalidTwoFactorCodeError, UnknownAccountError)
+
+CYNC_ERROR_INVALID_PASSWORD = 4001007
+CYNC_ERROR_INVALID_TWO_FACTOR_CODE = 4001379
+CYNC_ERROR_USER_NOT_FOUND = 4041011
+
+
+async def _read_cync_error(resp: ClientResponse) -> tuple[int | None, str | None]:
+    """Return the (code, msg) from a Cync error response body, or (None, None) if the body is not a Cync error."""
+    try:
+        body = await resp.json(content_type=None)
+    except (ValueError, ClientError):
+        return None, None
+
+    error = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(error, dict):
+        return None, None
+
+    code, msg = error.get("code"), error.get("msg")
+    if not isinstance(code, int) or not isinstance(msg, str):
+        return None, None
+
+    return code, msg
 
 
 class Auth:
@@ -73,6 +96,11 @@ class Auth:
             return auth_response
         except BadRequestError:
             raise TwoFactorRequiredError("Two factor verification required.")
+        except CyncError as ex:
+            if ex.error_code == CYNC_ERROR_USER_NOT_FOUND:
+                raise UnknownAccountError("No Cync account exists for this email address",
+                                          error_code=ex.error_code, error_msg=ex.error_msg) from ex
+            raise
 
     async def _async_auth_user_two_factor(self, two_factor_code: str):
         """Attempt to authenticate user with a two factor code."""
@@ -84,7 +112,17 @@ class Auth:
                                                           method="POST", json=two_factor_request)
             return auth_response
         except BadRequestError as ex:
-            raise AuthFailedError("Invalid two-factor code") from ex
+            if ex.error_code == CYNC_ERROR_INVALID_PASSWORD:
+                raise InvalidPasswordError("Invalid password",
+                                           error_code=ex.error_code, error_msg=ex.error_msg) from ex
+            if ex.error_code == CYNC_ERROR_INVALID_TWO_FACTOR_CODE:
+                raise InvalidTwoFactorCodeError("Invalid two-factor code",
+                                                error_code=ex.error_code, error_msg=ex.error_msg) from ex
+
+            msg = "Two-factor authentication failed"
+            if ex.error_code is not None:
+                msg = f"{msg} (Cync error {ex.error_code}: {ex.error_msg})"
+            raise AuthFailedError(msg, error_code=ex.error_code, error_msg=ex.error_msg) from ex
 
     async def async_refresh_user_token(self):
         """
@@ -139,7 +177,8 @@ class Auth:
 
         async with resp:
             if resp.status == 400:
-                raise BadRequestError("Bad Request")
+                error_code, error_msg = await _read_cync_error(resp)
+                raise BadRequestError("Bad Request", error_code=error_code, error_msg=error_msg)
 
             if resp.status == 401 or resp.status == 403:
                 await self.async_refresh_user_token()
@@ -154,6 +193,7 @@ class Auth:
                     resp = await self.session.request(method, url, headers=headers)
 
             if raise_for_status:
+                error_code, error_msg = await _read_cync_error(resp) if resp.status == 404 else (None, None)
                 try:
                     resp.raise_for_status()
                 except ClientResponseError as ex:
@@ -161,6 +201,6 @@ class Auth:
                         f"HTTP error with status code {resp.status} "
                         f"during query of url {url}: {ex}"
                     )
-                    raise CyncError(msg) from ex
+                    raise CyncError(msg, error_code=error_code, error_msg=error_msg) from ex
 
             return await resp.json()
