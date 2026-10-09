@@ -5,8 +5,8 @@ import pytest
 from aiohttp import ClientResponseError
 
 from pycync import Auth, User
-from pycync import exceptions
-from pycync.exceptions import AuthFailedError, BadRequestError, CyncError, TwoFactorRequiredError
+from pycync.exceptions import (AuthFailedError, BadRequestError, CyncError, InvalidPasswordError,
+                               InvalidTwoFactorCodeError, TwoFactorRequiredError, UnknownAccountError)
 
 TOKENS = {
     "access_token": "test_access_token",
@@ -59,7 +59,7 @@ def make_auth(responses):
 async def test_two_factor_wrong_password_raises_invalid_password_error():
     auth, _ = make_auth([FakeResponse(400, cync_error(4001007, "password error"))])
 
-    with pytest.raises(exceptions.InvalidPasswordError) as exc_info:
+    with pytest.raises(InvalidPasswordError) as exc_info:
         await auth.login("123456")
 
     assert isinstance(exc_info.value, AuthFailedError)
@@ -67,10 +67,21 @@ async def test_two_factor_wrong_password_raises_invalid_password_error():
 
 
 @pytest.mark.asyncio
+async def test_two_factor_error_without_msg_still_maps_code():
+    auth, _ = make_auth([FakeResponse(400, {"error": {"code": 4001007}})])
+
+    with pytest.raises(InvalidPasswordError) as exc_info:
+        await auth.login("123456")
+
+    assert exc_info.value.error_code == 4001007
+    assert exc_info.value.error_msg is None
+
+
+@pytest.mark.asyncio
 async def test_two_factor_wrong_code_raises_invalid_two_factor_code_error():
     auth, _ = make_auth([FakeResponse(400, cync_error(4001379, "two factor verification code error"))])
 
-    with pytest.raises(exceptions.InvalidTwoFactorCodeError, match="Invalid two-factor code") as exc_info:
+    with pytest.raises(InvalidTwoFactorCodeError, match="Invalid two-factor code") as exc_info:
         await auth.login("123456")
 
     assert isinstance(exc_info.value, AuthFailedError)
@@ -101,15 +112,38 @@ async def test_two_factor_non_json_error_body_raises_plain_auth_failed_error():
 
 
 @pytest.mark.asyncio
-async def test_login_without_code_requests_two_factor_email():
+@pytest.mark.parametrize("body", [
+    {"error": {"code": "4001007", "msg": "password error"}},
+    {"error": None},
+    {"error": "oops"},
+    [cync_error(4001007, "password error")],
+])
+async def test_two_factor_malformed_error_body_raises_plain_auth_failed_error(body):
+    auth, _ = make_auth([FakeResponse(400, body)])
+
+    with pytest.raises(AuthFailedError) as exc_info:
+        await auth.login("123456")
+
+    assert type(exc_info.value) is AuthFailedError
+    assert exc_info.value.error_code is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code, msg", [
+    (4001381, "user version error"),
+    (4009999, "something else"),
+])
+async def test_login_without_code_requests_two_factor_email(code, msg):
     auth, session = make_auth([
-        FakeResponse(400, cync_error(4001381, "user version error")),
+        FakeResponse(400, cync_error(code, msg)),
         FakeResponse(200, {}),
     ])
 
-    with pytest.raises(TwoFactorRequiredError):
+    with pytest.raises(TwoFactorRequiredError) as exc_info:
         await auth.login()
 
+    assert exc_info.value.error_code == code
+    assert exc_info.value.error_msg == msg
     assert len(session.calls) == 2
     assert session.calls[0]["url"].endswith("/v2/user_auth")
     assert session.calls[1]["url"].endswith("/v2/two_factor/email/verifycode")
@@ -119,7 +153,7 @@ async def test_login_without_code_requests_two_factor_email():
 async def test_login_unknown_account_raises_unknown_account_error_without_sending_code():
     auth, session = make_auth([FakeResponse(404, cync_error(4041011, "user not exists"))])
 
-    with pytest.raises(exceptions.UnknownAccountError) as exc_info:
+    with pytest.raises(UnknownAccountError) as exc_info:
         await auth.login()
 
     assert isinstance(exc_info.value, AuthFailedError)

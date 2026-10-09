@@ -8,14 +8,11 @@ from typing import Any
 
 from aiohttp import ClientError, ClientResponse, ClientSession, ClientResponseError
 
-from .const import GE_CORP_ID, REST_API_BASE_URL
+from .const import (GE_CORP_ID, REST_API_BASE_URL, CYNC_ERROR_INVALID_PASSWORD, CYNC_ERROR_INVALID_TWO_FACTOR_CODE,
+                    CYNC_ERROR_USER_NOT_FOUND)
 from .user import User
 from .exceptions import (BadRequestError, TwoFactorRequiredError, AuthFailedError, CyncError, InvalidPasswordError,
                          InvalidTwoFactorCodeError, UnknownAccountError)
-
-CYNC_ERROR_INVALID_PASSWORD = 4001007
-CYNC_ERROR_INVALID_TWO_FACTOR_CODE = 4001379
-CYNC_ERROR_USER_NOT_FOUND = 4041011
 
 
 async def _read_cync_error(resp: ClientResponse) -> tuple[int | None, str | None]:
@@ -30,10 +27,10 @@ async def _read_cync_error(resp: ClientResponse) -> tuple[int | None, str | None
         return None, None
 
     code, msg = error.get("code"), error.get("msg")
-    if not isinstance(code, int) or not isinstance(msg, str):
+    if not isinstance(code, int):
         return None, None
 
-    return code, msg
+    return code, msg if isinstance(msg, str) else None
 
 
 class Auth:
@@ -74,12 +71,13 @@ class Auth:
                 self._user = User(user_info["access_token"], user_info["refresh_token"], user_info["authorize"],
                                   user_info["user_id"], expire_in=user_info["expire_in"])
                 return self._user
-            except TwoFactorRequiredError:
+            except TwoFactorRequiredError as ex:
                 two_factor_request = {'corp_id': GE_CORP_ID, 'email': self.username, 'local_lang': "en-us"}
 
                 await self._send_user_request(url=f'{REST_API_BASE_URL}/v2/two_factor/email/verifycode', method="POST",
                                               json=two_factor_request)
-                raise TwoFactorRequiredError('Two factor verification required. Code sent to user email.')
+                raise TwoFactorRequiredError('Two factor verification required. Code sent to user email.',
+                                             error_code=ex.error_code, error_msg=ex.error_msg)
         else:
             user_info = await self._async_auth_user_two_factor(two_factor_code)
             self._user = User(user_info["access_token"], user_info["refresh_token"], user_info["authorize"],
@@ -94,8 +92,9 @@ class Auth:
             auth_response = await self._send_user_request(url=f'{REST_API_BASE_URL}/v2/user_auth', method="POST",
                                                           json=auth_data)
             return auth_response
-        except BadRequestError:
-            raise TwoFactorRequiredError("Two factor verification required.")
+        except BadRequestError as ex:
+            raise TwoFactorRequiredError("Two factor verification required.",
+                                         error_code=ex.error_code, error_msg=ex.error_msg) from ex
         except CyncError as ex:
             if ex.error_code == CYNC_ERROR_USER_NOT_FOUND:
                 raise UnknownAccountError("No Cync account exists for this email address",
